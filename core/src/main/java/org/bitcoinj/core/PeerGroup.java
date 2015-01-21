@@ -18,6 +18,7 @@
 package org.bitcoinj.core;
 
 import com.google.common.annotations.VisibleForTesting;
+import com.google.common.base.*;
 import com.google.common.collect.ImmutableList;
 import com.google.common.collect.ImmutableSet;
 import com.google.common.collect.Lists;
@@ -79,7 +80,13 @@ import static com.google.common.base.Preconditions.checkState;
  */
 public class PeerGroup implements TransactionBroadcaster {
     private static final Logger log = LoggerFactory.getLogger(PeerGroup.class);
-    private static final int DEFAULT_CONNECTIONS = 4;
+    /**
+     * The default number of connections to the p2p network the library will try to build. This is set to 12 empirically.
+     * It used to be 4, but because we divide the connection pool in two for broadcasting transactions, that meant we
+     * were only sending transactions to two peers and sometimes this wasn't reliable enough: transactions wouldn't
+     * get through.
+     */
+    public static final int DEFAULT_CONNECTIONS = 12;
     private static final int TOR_TIMEOUT_SECONDS = 60;
     private int vMaxPeersToDiscoverCount = 100;
 
@@ -1169,10 +1176,15 @@ public class PeerGroup implements TransactionBroadcaster {
         pendingPeers.add(peer);
 
         try {
-            channels.openConnection(address.toSocketAddress(), peer);
-        } catch (Exception e) {
-            log.warn("Failed to connect to " + address + ": " + e.getMessage());
-            handlePeerDeath(peer, e);
+            log.info("Attempting connection to {}     ({} connected, {} pending, {} max)", address,
+                    peers.size(), pendingPeers.size(), maxConnections);
+            ListenableFuture<SocketAddress> future = channels.openConnection(address.toSocketAddress(), peer);
+            if (future.isDone())
+                Uninterruptibles.getUninterruptibly(future);
+        } catch (ExecutionException e) {
+            Throwable cause = Throwables.getRootCause(e);
+            log.warn("Failed to connect to " + address + ": " + cause.getMessage());
+            handlePeerDeath(peer, cause);
             return null;
         }
         peer.setSocketTimeout(connectTimeoutMillis);
@@ -1245,10 +1257,10 @@ public class PeerGroup implements TransactionBroadcaster {
             backoffMap.get(peer.getAddress()).trackSuccess();
 
             // Sets up the newly connected peer so it can do everything it needs to.
-            log.info("{}: New peer", peer);
             pendingPeers.remove(peer);
             peers.add(peer);
             newSize = peers.size();
+            log.info("{}: New peer      ({} connected, {} pending, {} max)", peer, newSize, pendingPeers.size(), maxConnections);
             // Give the peer a filter that can be used to probabilistically drop transactions that
             // aren't relevant to our wallet. We may still receive some false positives, which is
             // OK because it helps improve wallet privacy. Old nodes will just ignore the message.
@@ -1386,7 +1398,7 @@ public class PeerGroup implements TransactionBroadcaster {
         }
     }
 
-    protected void handlePeerDeath(final Peer peer, @Nullable Exception exception) {
+    protected void handlePeerDeath(final Peer peer, @Nullable Throwable exception) {
         // Peer deaths can occur during startup if a connect attempt after peer discovery aborts immediately.
         if (!isRunning()) return;
 
@@ -1399,7 +1411,7 @@ public class PeerGroup implements TransactionBroadcaster {
 
             PeerAddress address = peer.getAddress();
 
-            log.info("{}: Peer died", address);
+            log.info("{}: Peer died      ({} connected, {} pending, {} max)", address, peers.size(), pendingPeers.size(), maxConnections);
             if (peer == downloadPeer) {
                 log.info("Download peer died. Picking a new one.");
                 setDownloadPeer(null);
@@ -1417,7 +1429,7 @@ public class PeerGroup implements TransactionBroadcaster {
 
             groupBackoff.trackFailure();
 
-            if (!(exception instanceof NoRouteToHostException)) {
+            if (exception instanceof NoRouteToHostException) {
                 if (address.getAddr() instanceof Inet6Address && !ipv6Unreachable) {
                     ipv6Unreachable = true;
                     log.warn("IPv6 peer connect failed due to routing failure, ignoring IPv6 addresses from now on");
@@ -1569,7 +1581,7 @@ public class PeerGroup implements TransactionBroadcaster {
      * Returns the number of connections that are required before transactions will be broadcast. If there aren't
      * enough, {@link PeerGroup#broadcastTransaction(Transaction)} will wait until the minimum number is reached so
      * propagation across the network can be observed. If no value has been set using
-     * {@link PeerGroup#setMinBroadcastConnections(int)} a default of half of whatever
+     * {@link PeerGroup#setMinBroadcastConnections(int)} a default of 80% of whatever
      * {@link org.bitcoinj.core.PeerGroup#getMaxConnections()} returns is used.
      */
     public int getMinBroadcastConnections() {
@@ -1580,7 +1592,7 @@ public class PeerGroup implements TransactionBroadcaster {
                 if (max <= 1)
                     return max;
                 else
-                    return (int) Math.round(getMaxConnections() / 2.0);
+                    return (int) Math.round(getMaxConnections() * 0.8);
             }
             return minBroadcastConnections;
         } finally {
